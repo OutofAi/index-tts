@@ -339,9 +339,11 @@ class IndexTTS2:
             interval_silence=200,
             verbose=False,
             max_text_tokens_per_segment=120,
-            speed=1.0,   # <--- new
+            speed=1.0,             
+            target_length_ms=None,  
             **generation_kwargs
         ):
+
         print(">> starting inference...")
         self._set_gr_progress(0, "starting inference...")
         if verbose:
@@ -511,14 +513,12 @@ class IndexTTS2:
         # broadcast speaker/emotion conditions across batch
         spk_cond_b = spk_cond_emb.expand(B, -1, -1).contiguous()
         emo_cond_b = emo_cond_emb.expand(B, -1, -1).contiguous()
-
         cond_lengths = torch.full((B,), spk_cond_b.shape[1], device=self.device, dtype=torch.long)
         emo_cond_lengths = torch.full((B,), emo_cond_b.shape[1], device=self.device, dtype=torch.long)
 
         m_start_time = time.perf_counter()
         with torch.no_grad():
             with torch.amp.autocast(text_tokens_padded.device.type, enabled=self.dtype is not None, dtype=self.dtype):
-                # let merge_emovec work on the batched speaker/emo conds
                 emovec = self.gpt.merge_emovec(
                     spk_cond_b,
                     emo_cond_b,
@@ -527,9 +527,7 @@ class IndexTTS2:
                     alpha=emo_alpha,
                 )
 
-                # if we have a custom emotion vector, mix it in the same way as before
                 if emo_vector is not None:
-                    # emovec_mat and weight_vector were computed earlier in infer()
                     emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
 
                 codes_batch, speech_conditioning_latent_batch = self.gpt.inference_speech(
@@ -552,6 +550,35 @@ class IndexTTS2:
                 )
         gpt_gen_time += time.perf_counter() - m_start_time
 
+        # --- precompute per-segment code lengths (trim at stop_mel_token) ---
+        code_lens_list = []
+        for b in range(B):
+            code = codes_batch[b]
+            if not torch.any(code == self.stop_mel_token).item():
+                code_len = code.size(0)
+            else:
+                stop_idx = (code == self.stop_mel_token).nonzero(as_tuple=False)
+                code_len = stop_idx[0].item()  # first stop token index
+            code_lens_list.append(code_len)
+
+        code_lens_all = torch.tensor(code_lens_list, device=self.device, dtype=torch.long)
+
+        # --- map total desired duration (ms) -> per-segment target_lengths (frames) ---
+        per_seg_target_lengths = None
+        if target_length_ms is not None and target_length_ms > 0:
+            base_factor = 1.72  # same factor as original
+            base_frames = code_lens_all.float() * base_factor
+            total_base_frames = base_frames.sum()
+
+            hop_length = self.cfg.s2mel['preprocess_params']['spect_params']['hop_length']
+            sampling_rate = 22050  # or self.cfg.s2mel["preprocess_params"]["sr"]
+            estimated_seconds_base = (total_base_frames * hop_length) / float(sampling_rate)
+
+            if estimated_seconds_base > 1e-3:
+                desired_seconds = target_length_ms / 1000.0
+                ratio = desired_seconds / estimated_seconds_base
+                per_seg_frames = (base_frames * ratio).clamp(min=1.0).long()
+                per_seg_target_lengths = per_seg_frames  # [B]
 
         for seg_idx in range(segments_count):
             self._set_gr_progress(
@@ -559,23 +586,14 @@ class IndexTTS2:
                 f"speech synthesis {seg_idx + 1}/{segments_count}..."
             )
 
-            # slice per-segment tensors from the batched outputs
             text_tokens = text_tokens_padded[seg_idx:seg_idx + 1]                # [1, T_text]
             codes = codes_batch[seg_idx:seg_idx + 1]                             # [1, T_code]
             speech_conditioning_latent = speech_conditioning_latent_batch[seg_idx:seg_idx + 1]
 
-            # --- same stop_mel_token trimming logic you had before ---
-            code_lens = []
-            for code in codes:
-                if self.stop_mel_token not in code:
-                    code_len = len(code)
-                else:
-                    len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0] + 1
-                    code_len = len_ - 1
-                code_lens.append(code_len)
-
+            # use precomputed code length for this segment
+            code_len = int(code_lens_all[seg_idx].item())
             codes = codes[:, :code_len]
-            code_lens = torch.LongTensor(code_lens).to(self.device)
+            code_lens = torch.tensor([code_len], device=self.device, dtype=torch.long)
 
             if (codes[:, -1] != self.stop_mel_token).any() and not has_warned:
                 warnings.warn(
@@ -620,7 +638,12 @@ class IndexTTS2:
                 S_infer = S_infer + latent
 
                 base_factor = 1.72
-                target_lengths = (code_lens * base_factor / max(speed, 1e-3)).long()
+                if per_seg_target_lengths is not None:
+                    # explicit time-based target length for this segment
+                    target_lengths = per_seg_target_lengths[seg_idx:seg_idx + 1].to(S_infer.device)
+                else:
+                    # original speed-based behavior
+                    target_lengths = (code_lens * base_factor / max(speed, 1e-3)).long()
 
                 cond = self.s2mel.models['length_regulator'](
                     S_infer,
@@ -643,17 +666,17 @@ class IndexTTS2:
                 vc_target = vc_target[:, :, ref_mel.size(-1):]
                 s2mel_time += time.perf_counter() - m_start_time
 
-                # ---- FIX: make sure we pass a normal, non-inference tensor to BigVGAN ----
                 vc_target = vc_target.clone().detach()
 
                 m_start_time = time.perf_counter()
-                with torch.no_grad():  # gradients not needed for vocoder at inference
+                with torch.no_grad():
                     wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
                 bigvgan_time += time.perf_counter() - m_start_time
                 wav = wav.squeeze(1)
 
             wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
             wavs.append(wav.cpu())
+
 
         end_time = time.perf_counter()
 
