@@ -323,7 +323,23 @@ class IndexTTS2:
                 print(f"Audio too long ({audio.shape[1]} samples), truncating to {max_audio_samples} samples")
             audio = audio[:, :max_audio_samples]
         return audio, sr
+        
+    def _segment_text(self, text, max_text_tokens_per_segment):
+        """
+        Split a single text into segments, return per-segment token tensors
+        (un-padded) plus the raw segment token lists.
+        """
+        text_tokens_list = self.tokenizer.tokenize(text)
+        segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
+    
+        token_tensors = []
+        for seg in segments:
+            ids = self.tokenizer.convert_tokens_to_ids(seg)
+            token_tensors.append(torch.tensor(ids, dtype=torch.int32))
+    
+        return token_tensors, segments
 
+    
     @torch.no_grad()
     def infer_batch(
         self,
