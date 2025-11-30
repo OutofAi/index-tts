@@ -324,6 +324,437 @@ class IndexTTS2:
             audio = audio[:, :max_audio_samples]
         return audio, sr
 
+    @torch.no_grad()
+    def infer_batch(
+        self,
+        spk_audio_prompts,
+        texts,
+        output_paths,
+        emo_audio_prompts=None,
+        emo_alpha=1.0,
+        emo_vectors=None,
+        use_emo_text=False,
+        emo_texts=None,
+        use_random=False,
+        interval_silence=200,
+        verbose=False,
+        max_text_tokens_per_segment=120,
+        speed=1.0,
+        target_length_ms=None,
+        **generation_kwargs,
+    ):
+        """
+        Batched version of infer:
+          - multiple speakers / texts / outputs
+          - GPT autoregressive call is one big batch over all segments
+          - s2mel / BigVGAN still run per segment
+        """
+        assert len(spk_audio_prompts) == len(texts) == len(output_paths)
+        N = len(texts)
+        if emo_audio_prompts is None:
+            emo_audio_prompts = spk_audio_prompts
+        if emo_vectors is None:
+            emo_vectors = [None] * N
+        if emo_texts is None:
+            emo_texts = texts
+    
+        print(f">> starting batched inference for {N} items...")
+        start_time = time.perf_counter()
+    
+        # ------------------------------------------------------------------
+        # 1) PREP SPEAKER + EMOTION CONDITIONS PER ITEM
+        #    (re-use existing caching logic item-by-item)
+        # ------------------------------------------------------------------
+        spk_cond_list = []
+        emo_cond_list = []
+        style_list = []
+        prompt_condition_list = []
+        ref_mel_list = []
+        emovec_mat_list = []
+        weight_vector_list = []
+    
+        for i in range(N):
+            spk_audio_prompt = spk_audio_prompts[i]
+            emo_audio_prompt = emo_audio_prompts[i]
+            emo_vector = emo_vectors[i]
+    
+            # --- emotion from text if requested ---
+            if use_emo_text and emo_vector is None:
+                emo_dict = self.qwen_emo.inference(emo_texts[i])
+                if verbose:
+                    print(f"[{i}] detected emotion vectors from text: {emo_dict}")
+                emo_vector = list(emo_dict.values())
+                emo_vectors[i] = emo_vector  # update
+    
+            if emo_vector is not None:
+                emo_vector_scale = max(0.0, min(1.0, emo_alpha))
+                if emo_vector_scale != 1.0:
+                    emo_vector = [int(x * emo_vector_scale * 10000) / 10000 for x in emo_vector]
+                    emo_vectors[i] = emo_vector
+    
+            # if no external emo audio, use speaker audio
+            if emo_audio_prompt is None:
+                emo_audio_prompt = spk_audio_prompt
+                emo_audio_prompts[i] = emo_audio_prompt
+    
+            # ----- speaker caching: just reuse your existing code -----
+            if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
+                audio, sr = self._load_and_cut_audio(spk_audio_prompt, 15, verbose)
+                audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
+                audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
+    
+                inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+                input_features = inputs["input_features"].to(self.device)
+                attention_mask = inputs["attention_mask"].to(self.device)
+                spk_cond_emb = self.get_emb(input_features, attention_mask)
+    
+                _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+                ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
+                ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+                feat = torchaudio.compliance.kaldi.fbank(
+                    audio_16k.to(ref_mel.device),
+                    num_mel_bins=80,
+                    dither=0,
+                    sample_frequency=16000
+                )
+                feat = feat - feat.mean(dim=0, keepdim=True)
+                style = self.campplus_model(feat.unsqueeze(0))
+    
+                prompt_condition = self.s2mel.models['length_regulator'](
+                    S_ref,
+                    ylens=ref_target_lengths,
+                    n_quantizers=3,
+                    f0=None
+                )[0]
+    
+                # cache "last" speaker only (your existing behavior);
+                # if you want per-speaker caching, upgrade cache to dict.
+                self.cache_spk_cond = spk_cond_emb
+                self.cache_s2mel_style = style
+                self.cache_s2mel_prompt = prompt_condition
+                self.cache_spk_audio_prompt = spk_audio_prompt
+                self.cache_mel = ref_mel
+            else:
+                spk_cond_emb = self.cache_spk_cond
+                style = self.cache_s2mel_style
+                prompt_condition = self.cache_s2mel_prompt
+                ref_mel = self.cache_mel
+    
+            # ----- emotion audio caching -----
+            if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
+                emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt, 15, verbose, sr=16000)
+                emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+                emo_input_features = emo_inputs["input_features"].to(self.device)
+                emo_attention_mask = emo_inputs["attention_mask"].to(self.device)
+                emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+    
+                self.cache_emo_cond = emo_cond_emb
+                self.cache_emo_audio_prompt = emo_audio_prompt
+            else:
+                emo_cond_emb = self.cache_emo_cond
+    
+            # ----- optional emotion mixing with emo_vector -----
+            if emo_vector is not None:
+                weight_vector = torch.tensor(emo_vector).to(self.device)
+                weight_vector_list.append(weight_vector)
+                if use_random:
+                    random_index = [random.randint(0, x - 1) for x in self.emo_num]
+                else:
+                    random_index = [find_most_similar_cosine(style, tmp) for tmp in self.spk_matrix]
+                emo_matrix = [tmp[index].unsqueeze(0) for index, tmp in zip(random_index, self.emo_matrix)]
+                emo_matrix = torch.cat(emo_matrix, 0)
+                emovec_mat = weight_vector.unsqueeze(1) * emo_matrix
+                emovec_mat = torch.sum(emovec_mat, 0).unsqueeze(0)
+            else:
+                emovec_mat = None
+                weight_vector = None
+                weight_vector_list.append(None)
+    
+            spk_cond_list.append(spk_cond_emb)        # [1, T_spk, C]
+            emo_cond_list.append(emo_cond_emb)        # [1, T_emo, C]
+            style_list.append(style)
+            prompt_condition_list.append(prompt_condition)
+            ref_mel_list.append(ref_mel)
+            emovec_mat_list.append(emovec_mat)
+    
+        # ------------------------------------------------------------------
+        # 2) BUILD GLOBAL TEXT BATCH (CHUNKING EACH TEXT)
+        # ------------------------------------------------------------------
+        # meta arrays to track which segment belongs to which item
+        seg2item = []   # length B, each entry in [0, N-1]
+        seg2local_idx = []
+        token_tensors_all = []
+    
+        for i, text in enumerate(texts):
+            token_tensors, _segments = self._segment_text(text, max_text_tokens_per_segment)
+            for j, t in enumerate(token_tensors):
+                seg2item.append(i)
+                seg2local_idx.append(j)
+                token_tensors_all.append(t)
+    
+        B = len(token_tensors_all)
+        if verbose:
+            print(f">> total segments across batch: {B}")
+    
+        text_lengths = torch.tensor([t.size(0) for t in token_tensors_all],
+                                    dtype=torch.long, device=self.device)
+    
+        # --- pad text tokens across whole batch ---
+        vocab_limit = self.gpt.number_text_tokens * getattr(self.gpt, "types", 1)
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_id is None or pad_id < 0 or pad_id > vocab_limit:
+            pad_id = int(self.gpt.stop_text_token)
+    
+        text_tokens_padded = pad_sequence(
+            token_tensors_all,
+            batch_first=True,
+            padding_value=pad_id
+        ).to(self.device)
+    
+        assert text_tokens_padded.min() >= 0
+        assert text_tokens_padded.max() <= vocab_limit
+    
+        # ------------------------------------------------------------------
+        # 3) BUILD MATCHING SPEAKER / EMO CONDITION BATCHES PER SEGMENT
+        # ------------------------------------------------------------------
+        spk_cond_b_list = []
+        emo_cond_b_list = []
+        cond_lengths_list = []
+        emo_cond_lengths_list = []
+    
+        for b in range(B):
+            i = seg2item[b]
+            spk_cond_emb = spk_cond_list[i]  # [1, T_spk, C]
+            emo_cond_emb = emo_cond_list[i]
+    
+            spk_cond_b_list.append(spk_cond_emb.squeeze(0))
+            emo_cond_b_list.append(emo_cond_emb.squeeze(0))
+            cond_lengths_list.append(spk_cond_emb.shape[1])
+            emo_cond_lengths_list.append(emo_cond_emb.shape[1])
+    
+        # pad speaker / emo conditions so they can form a single batch
+        spk_cond_b = pad_sequence(spk_cond_b_list, batch_first=True)  # [B, T_spk_max, C]
+        emo_cond_b = pad_sequence(emo_cond_b_list, batch_first=True)  # [B, T_emo_max, C]
+        cond_lengths = torch.tensor(cond_lengths_list, device=self.device, dtype=torch.long)
+        emo_cond_lengths = torch.tensor(emo_cond_lengths_list, device=self.device, dtype=torch.long)
+    
+        # ------------------------------------------------------------------
+        # 4) RUN GPT AUTOREGRESSIVE INFERENCE ONCE FOR THE WHOLE BATCH
+        # ------------------------------------------------------------------
+        do_sample = generation_kwargs.pop("do_sample", True)
+        top_p = generation_kwargs.pop("top_p", 0.8)
+        top_k = generation_kwargs.pop("top_k", 30)
+        temperature = generation_kwargs.pop("temperature", 0.8)
+        autoregressive_batch_size = 1
+        length_penalty = generation_kwargs.pop("length_penalty", 0.0)
+        num_beams = generation_kwargs.pop("num_beams", 3)
+        repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
+        max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
+        sampling_rate = 22050
+    
+        gpt_gen_time = 0.0
+        gpt_forward_time = 0.0
+        s2mel_time = 0.0
+        bigvgan_time = 0.0
+    
+        m_start_time = time.perf_counter()
+        with torch.amp.autocast(text_tokens_padded.device.type,
+                                 enabled=self.dtype is not None,
+                                 dtype=self.dtype):
+            # merge emovec per segment owner
+            emovec = self.gpt.merge_emovec(
+                spk_cond_b,
+                emo_cond_b,
+                cond_lengths,
+                emo_cond_lengths,
+                alpha=emo_alpha,
+            )
+    
+            # optional emovec_mat overrides
+            for b in range(B):
+                i = seg2item[b]
+                emat = emovec_mat_list[i]
+                wv = weight_vector_list[i]
+                if emat is not None and wv is not None:
+                    emovec[b:b+1] = emat + (1 - torch.sum(wv)) * emovec[b:b+1]
+    
+            codes_batch, speech_conditioning_latent_batch = self.gpt.inference_speech(
+                spk_cond_b,
+                text_tokens_padded,
+                emo_cond_b,
+                cond_lengths=cond_lengths,
+                emo_cond_lengths=emo_cond_lengths,
+                emo_vec=emovec,
+                do_sample=do_sample,
+                top_p=top_p,
+                top_k=top_k,
+                temperature=temperature,
+                num_return_sequences=autoregressive_batch_size,
+                length_penalty=length_penalty,
+                num_beams=num_beams,
+                repetition_penalty=repetition_penalty,
+                max_generate_length=max_mel_tokens,
+                **generation_kwargs,
+            )
+        gpt_gen_time += time.perf_counter() - m_start_time
+    
+        # ------------------------------------------------------------------
+        # 5) PER-SEGMENT POST-PROCESSING (s2mel + BigVGAN) WITH MAPPING BACK
+        # ------------------------------------------------------------------
+        # trim codes and compute per-seg lengths
+        code_lens_list = []
+        for b in range(B):
+            code = codes_batch[b]
+            if not torch.any(code == self.stop_mel_token).item():
+                code_len = code.size(0)
+            else:
+                stop_idx = (code == self.stop_mel_token).nonzero(as_tuple=False)
+                code_len = stop_idx[0].item()
+            code_lens_list.append(code_len)
+        code_lens_all = torch.tensor(code_lens_list, device=self.device, dtype=torch.long)
+    
+        # optional global target length logic, same as your single infer
+        per_seg_target_lengths = None
+        if target_length_ms is not None and target_length_ms > 0:
+            base_factor = 1.72
+            base_frames = code_lens_all.float() * base_factor
+            total_base_frames = base_frames.sum()
+            hop_length = self.cfg.s2mel['preprocess_params']['spect_params']['hop_length']
+            sr = 22050
+            estimated_seconds_base = (total_base_frames * hop_length) / float(sr)
+            if estimated_seconds_base > 1e-3:
+                desired_seconds = target_length_ms / 1000.0
+                ratio = desired_seconds / estimated_seconds_base
+                per_seg_frames = (base_frames * ratio).clamp(min=1.0).long()
+                per_seg_target_lengths = per_seg_frames
+    
+        # collect wavs per item
+        wavs_per_item = [[] for _ in range(N)]
+        has_warned = False
+    
+        for b in range(B):
+            i = seg2item[b]               # owner item index
+            seg_idx = seg2local_idx[b]
+    
+            text_tokens = text_tokens_padded[b:b+1]
+            codes = codes_batch[b:b+1]
+            speech_conditioning_latent = speech_conditioning_latent_batch[b:b+1]
+    
+            code_len = int(code_lens_all[b].item())
+            codes = codes[:, :code_len]
+            code_lens = torch.tensor([code_len], device=self.device, dtype=torch.long)
+    
+            if (codes[:, -1] != self.stop_mel_token).any() and not has_warned:
+                warnings.warn(
+                    f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}).",
+                    category=RuntimeWarning
+                )
+                has_warned = True
+    
+            m_start_time = time.perf_counter()
+            use_speed = torch.zeros(1, device=self.device, dtype=torch.long)
+            emo_cond_b_i = emo_cond_list[i]
+            spk_cond_i = spk_cond_list[i]
+            emovec_i = emovec[b:b+1]
+    
+            with torch.amp.autocast(text_tokens.device.type,
+                                     enabled=self.dtype is not None,
+                                     dtype=self.dtype):
+                latent = self.gpt(
+                    speech_conditioning_latent,
+                    text_tokens,
+                    torch.tensor([text_tokens.shape[-1]], device=text_tokens.device),
+                    codes,
+                    torch.tensor([codes.shape[-1]], device=text_tokens.device),
+                    emo_cond_b_i,
+                    cond_mel_lengths=torch.tensor([spk_cond_i.shape[1]], device=text_tokens.device),
+                    emo_cond_mel_lengths=torch.tensor([emo_cond_b_i.shape[1]], device=text_tokens.device),
+                    emo_vec=emovec_i,
+                    use_speed=use_speed,
+                )
+            gpt_forward_time += time.perf_counter() - m_start_time
+    
+            # --- s2mel + vocoder (same as your single infer, but picking per-item style/prompt) ---
+            with torch.amp.autocast(text_tokens.device.type, enabled=False, dtype=None):
+                m_start_time = time.perf_counter()
+    
+                diffusion_steps = 25
+                inference_cfg_rate = 0.7
+                latent = self.s2mel.models['gpt_layer'](latent)
+                S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1)).transpose(1, 2)
+                S_infer = S_infer + latent
+    
+                if per_seg_target_lengths is not None:
+                    target_lengths = per_seg_target_lengths[b:b+1].to(S_infer.device)
+                else:
+                    base_factor = 1.72
+                    target_lengths = (code_lens * base_factor / max(speed, 1e-3)).long()
+    
+                prompt_condition = prompt_condition_list[i]
+                style = style_list[i]
+                ref_mel = ref_mel_list[i]
+    
+                cond = self.s2mel.models['length_regulator'](
+                    S_infer,
+                    ylens=target_lengths,
+                    n_quantizers=3,
+                    f0=None
+                )[0]
+    
+                cat_condition = torch.cat([prompt_condition, cond], dim=1)
+                vc_target = self.s2mel.models['cfm'].inference(
+                    cat_condition,
+                    torch.LongTensor([cat_condition.size(1)]).to(cond.device),
+                    ref_mel,
+                    style,
+                    None,
+                    diffusion_steps,
+                    inference_cfg_rate=inference_cfg_rate
+                )
+                vc_target = vc_target[:, :, ref_mel.size(-1):]
+                s2mel_time += time.perf_counter() - m_start_time
+    
+                vc_target = vc_target.clone().detach()
+    
+                m_start_time = time.perf_counter()
+                with torch.no_grad():
+                    wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
+                bigvgan_time += time.perf_counter() - m_start_time
+                wav = wav.squeeze(1)
+    
+            wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+            wavs_per_item[i].append(wav.cpu())
+    
+        # ------------------------------------------------------------------
+        # 6) SAVE PER-ITEM WAVS
+        # ------------------------------------------------------------------
+        sampling_rate = 22050
+        for i in range(N):
+            seg_wavs = self.insert_interval_silence(wavs_per_item[i], sampling_rate=sampling_rate,
+                                                    interval_silence=interval_silence)
+            if len(seg_wavs) == 0:
+                continue
+            wav = torch.cat(seg_wavs, dim=1).cpu()
+            out = output_paths[i]
+            if out:
+                if os.path.isfile(out):
+                    os.remove(out)
+                if os.path.dirname(out) != "":
+                    os.makedirs(os.path.dirname(out), exist_ok=True)
+                torchaudio.save(out, wav.type(torch.int16), sampling_rate)
+                if verbose:
+                    print(f">> [{i}] wav file saved to: {out}")
+    
+        end_time = time.perf_counter()
+        print(f">> gpt_gen_time (batched): {gpt_gen_time:.2f}s")
+        print(f">> gpt_forward_time: {gpt_forward_time:.2f}s")
+        print(f">> s2mel_time: {s2mel_time:.2f}s")
+        print(f">> bigvgan_time: {bigvgan_time:.2f}s")
+        print(f">> Total inference time (batch): {end_time - start_time:.2f}s")
+    
+        return output_paths
+    
+
     # 原始推理模式
     def infer(
             self,
