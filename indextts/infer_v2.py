@@ -1079,7 +1079,7 @@ class IndexTTS2:
                 has_warned = True
         
             # -------- NEW: just pick the precomputed latent -----------
-            latent = latent_batch[seg_idx:seg_idx + 1]   # [1, T_latent, C]
+            latent = latent_batch[seg_idx:seg_idx + 1, :code_len, :]   # [1, code_len, C]
             # -----------------------------------------------------------
 
             # -------------------- s2mel + BigVGAN ----------------------
