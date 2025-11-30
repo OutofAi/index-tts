@@ -690,7 +690,7 @@ class IndexTTS2:
                 has_warned = True
         
             # -------- NEW: just pick the precomputed latent -----------
-            latent = latent_batch[b:b+1]   # [1, T_latent, C]
+            latent = latent_batch[b:b+1, :code_len, :]   # [1, code_len, C]
             # -----------------------------------------------------------
         
             # --- s2mel + vocoder (unchanged, using prompt_condition_list[i], style_list[i], ref_mel_list[i]) ---
