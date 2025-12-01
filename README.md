@@ -27,6 +27,8 @@ This fork includes major improvements implemented in **`infer_v2.py`** :
 
 ### 🚀 Usage
 
+[target_length_ms usage is optional]
+
 #### **Single Inference**
 
 ```python
